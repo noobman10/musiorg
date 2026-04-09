@@ -47,7 +47,7 @@ A terminal UI music organizer. Scans your music directory, reads genre tags from
 ### From source (recommended)
 
 ```bash
-git clone https://codeberg.org/yourname/musiorg
+git clone https://codeberg.org/noobman/musiorg
 cd musiorg
 pip install .
 ```
