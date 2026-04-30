@@ -4,8 +4,8 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "musiorg"
-version = "0.1.0"
-description = "A TUI music organizer — sort your library into genre folders"
+version = "0.2.0"
+description = "A TUI music organizer — sort your library into genre folders, detect duplicates"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -13,6 +13,11 @@ dependencies = [
     "textual>=0.80",
     "mutagen>=1.47",
 ]
+
+# Optional: install chromaprint for acoustic fingerprinting
+# Ubuntu/Debian: sudo apt install chromaprint-tools
+# macOS:         brew install chromaprint
+# Windows:       https://acoustid.org/chromaprint
 
 [project.scripts]
 musiorg = "musiorg:main"
