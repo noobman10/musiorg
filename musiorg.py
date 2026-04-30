@@ -2,11 +2,11 @@
 """
 musiorg — Music Organizer TUI
 Scans a music directory, reads genre tags, and moves files into genre subfolders.
+Detects duplicate tracks by title tag (falls back to filename stem).
 """
 
 import os
 import shutil
-import threading
 from pathlib import Path
 from collections import defaultdict
 
@@ -16,7 +16,7 @@ from textual.containers import Container, Horizontal, Vertical, ScrollableContai
 from textual.reactive import reactive
 from textual.widgets import (
     Header, Footer, Static, Label, Button,
-    ProgressBar, DataTable, Input, Log,
+    ProgressBar, DataTable, Input, Log, Checkbox,
 )
 from textual.screen import Screen, ModalScreen
 from textual import work
@@ -34,6 +34,7 @@ AUDIO_EXTENSIONS = {
 }
 
 UNKNOWN_GENRE = "Unknown"
+TRASH_FOLDER  = ".musiorg_trash"
 
 APP_CSS = """
 /* ── Root ── */
@@ -125,6 +126,14 @@ Button.-danger {
 }
 Button.-danger:hover {
     background: #6d1f52;
+}
+Button.-warning {
+    background: #3d2a00;
+    color: #fcd34d;
+    border: solid #b45309;
+}
+Button.-warning:hover {
+    background: #5c3e00;
 }
 
 /* ── Stats bar ── */
@@ -224,6 +233,59 @@ ConfirmScreen {
     text-align: center;
     margin-bottom: 2;
 }
+
+/* ── Duplicate modal ── */
+DuplicateScreen {
+    align: center middle;
+}
+#dup-box {
+    background: #1a1a26;
+    border: solid #b45309;
+    padding: 2 3;
+    width: 80;
+    height: auto;
+    max-height: 40;
+}
+#dup-title {
+    color: #fcd34d;
+    text-style: bold;
+    text-align: center;
+    margin-bottom: 1;
+}
+#dup-subtitle {
+    color: #a78bfa;
+    text-align: center;
+    margin-bottom: 1;
+}
+#dup-scroll {
+    height: 20;
+    border: solid #2d1f4e;
+    background: #0e0e12;
+    margin-bottom: 1;
+}
+.dup-group-header {
+    color: #fcd34d;
+    text-style: bold;
+    padding: 0 1;
+    margin-top: 1;
+    background: #1e1a2e;
+}
+.dup-file-row {
+    padding: 0 2;
+    color: #d1c4f0;
+}
+.dup-keep {
+    color: #22c55e;
+    text-style: bold;
+}
+.dup-delete {
+    color: #f87171;
+}
+#dup-btn-row {
+    height: 3;
+    align: center middle;
+    margin-top: 1;
+}
 """
 
 
@@ -258,6 +320,7 @@ def collect_files(music_dir: Path):
     return [
         p for p in music_dir.rglob("*")
         if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
+        and TRASH_FOLDER not in p.parts
     ]
 
 
@@ -267,6 +330,69 @@ def scan_genres(files: list[Path]) -> dict[str, list[Path]]:
         genre = sanitize(get_genre(f))
         result[genre].append(f)
     return dict(result)
+
+
+def file_size_fmt(path: Path) -> str:
+    try:
+        b = path.stat().st_size
+        for unit in ("B", "KB", "MB", "GB"):
+            if b < 1024:
+                return f"{b:.1f} {unit}"
+            b /= 1024
+        return f"{b:.1f} TB"
+    except Exception:
+        return "?"
+
+
+def get_track_name(filepath: Path) -> str:
+    """
+    Read the 'title' tag from audio metadata.
+    Falls back to the filename stem (lowercased, stripped) if no tag is found.
+    """
+    if MutagenFile is not None:
+        try:
+            audio = MutagenFile(filepath, easy=True)
+            if audio is not None:
+                for key in ("title", "TITLE", "TIT2"):
+                    val = audio.get(key)
+                    if val:
+                        v = val[0] if isinstance(val, list) else str(val)
+                        v = v.strip()
+                        if v:
+                            return v.lower()
+        except Exception:
+            pass
+    # fallback: filename without extension
+    return filepath.stem.strip().lower()
+
+
+def find_duplicates_by_track_name(
+    files: list[Path],
+    progress_cb=None,
+) -> list[list[Path]]:
+    """
+    Group files that share the same track name (from metadata tags,
+    falling back to filename stem).  Only groups with 2+ files are returned.
+    progress_cb(current, total) is called after each file is processed.
+    """
+    name_map: dict[str, list[Path]] = defaultdict(list)
+    total = len(files)
+    for i, f in enumerate(files, 1):
+        key = get_track_name(f)
+        name_map[key].append(f)
+        if progress_cb:
+            progress_cb(i, total)
+    return [group for group in name_map.values() if len(group) > 1]
+
+
+def pick_keeper(group: list[Path]) -> Path:
+    """
+    Heuristic: prefer lossless formats, then highest file size.
+    """
+    LOSSLESS = {".flac", ".wav", ".aiff", ".ape", ".wv"}
+    lossless = [f for f in group if f.suffix.lower() in LOSSLESS]
+    candidates = lossless if lossless else group
+    return max(candidates, key=lambda f: f.stat().st_size if f.exists() else 0)
 
 
 # ── Confirm modal ─────────────────────────────────────────────────────────────
@@ -301,25 +427,99 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+# ── Duplicate review modal ────────────────────────────────────────────────────
+
+class DuplicateScreen(ModalScreen[list[Path]]):
+    """
+    Shows all duplicate groups.  For each group the suggested keeper is
+    highlighted in green; everything else is marked for deletion.
+    The user can press [A] to accept all suggestions, or [C] to cancel.
+    Returns a list of paths the user approved for deletion.
+    """
+    BINDINGS = [
+        Binding("a", "accept", "Accept all"),
+        Binding("c", "cancel_dup", "Cancel"),
+        Binding("escape", "cancel_dup", "Cancel"),
+    ]
+
+    def __init__(self, groups: list[list[Path]]):
+        super().__init__()
+        self._groups = groups
+        # pre-compute keepers
+        self._keepers: list[Path] = [pick_keeper(g) for g in groups]
+
+    def compose(self) -> ComposeResult:
+        to_delete = sum(len(g) - 1 for g in self._groups)
+        with Container(id="dup-box"):
+            yield Label("🗑  Duplicate Files Found", id="dup-title")
+            yield Label(
+                f"{len(self._groups)} group(s) · {to_delete} file(s) suggested for deletion",
+                id="dup-subtitle",
+            )
+            with ScrollableContainer(id="dup-scroll"):
+                for g_idx, (group, keeper) in enumerate(
+                    zip(self._groups, self._keepers), 1
+                ):
+                    yield Label(
+                        f"  Group {g_idx}", classes="dup-group-header"
+                    )
+                    for f in group:
+                        size = file_size_fmt(f)
+                        fmt  = f.suffix.upper().lstrip(".")
+                        if f == keeper:
+                            yield Label(
+                                f"  ✔ KEEP   [{fmt}] {size:>8}  {f.name}",
+                                classes="dup-file-row dup-keep",
+                            )
+                        else:
+                            yield Label(
+                                f"  ✖ DELETE [{fmt}] {size:>8}  {f.name}",
+                                classes="dup-file-row dup-delete",
+                            )
+
+            with Horizontal(id="dup-btn-row"):
+                yield Button("✔  Accept all  [A]", id="btn-dup-accept", classes="-warning")
+                yield Button("✕  Cancel  [C]",     id="btn-dup-cancel", classes="-danger")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-dup-accept":
+            self.action_accept()
+        else:
+            self.action_cancel_dup()
+
+    def action_accept(self) -> None:
+        to_delete: list[Path] = []
+        for group, keeper in zip(self._groups, self._keepers):
+            for f in group:
+                if f != keeper:
+                    to_delete.append(f)
+        self.dismiss(to_delete)
+
+    def action_cancel_dup(self) -> None:
+        self.dismiss([])
+
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 
 class MusiOrg(App):
     TITLE = "musiorg"
     CSS = APP_CSS
     BINDINGS = [
-        Binding("s", "scan", "Scan", show=True),
-        Binding("o", "organize", "Organize", show=True),
-        Binding("r", "reset", "Reset", show=True),
-        Binding("q", "quit", "Quit", show=True),
+        Binding("s", "scan",     "Scan",       show=True),
+        Binding("o", "organize", "Organize",   show=True),
+        Binding("d", "dupes",    "Duplicates", show=True),
+        Binding("r", "reset",    "Reset",      show=True),
+        Binding("q", "quit",     "Quit",       show=True),
     ]
 
     # reactive state
-    scanned: reactive[list[Path]] = reactive([], recompose=False)
-    genre_map: reactive[dict] = reactive({}, recompose=False)
-    scanning: reactive[bool] = reactive(False)
-    organizing: reactive[bool] = reactive(False)
-    progress: reactive[float] = reactive(0.0)
-    progress_label: reactive[str] = reactive("")
+    scanned:        reactive[list[Path]] = reactive([], recompose=False)
+    genre_map:      reactive[dict]       = reactive({}, recompose=False)
+    scanning:       reactive[bool]       = reactive(False)
+    organizing:     reactive[bool]       = reactive(False)
+    finding_dupes:  reactive[bool]       = reactive(False)
+    progress:       reactive[float]      = reactive(0.0)
+    progress_label: reactive[str]        = reactive("")
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -335,14 +535,15 @@ class MusiOrg(App):
 
         # ── action buttons ──
         with Horizontal(classes="btn-row"):
-            yield Button("⟳  Scan", id="btn-scan", classes="-primary")
-            yield Button("⏎  Organize", id="btn-organize")
-            yield Button("✕  Reset", id="btn-reset", classes="-danger")
+            yield Button("⟳  Scan",       id="btn-scan",     classes="-primary")
+            yield Button("⏎  Organize",   id="btn-organize")
+            yield Button("⊕  Duplicates", id="btn-dupes",    classes="-warning")
+            yield Button("✕  Reset",      id="btn-reset",    classes="-danger")
 
         # ── stats ──
         with Horizontal(id="stats-row"):
-            yield Static("Files: [bold]0[/]", id="stat-files", classes="stat-chip")
-            yield Static("Genres: [bold]0[/]", id="stat-genres", classes="stat-chip")
+            yield Static("Files: [bold]0[/]",   id="stat-files",   classes="stat-chip")
+            yield Static("Genres: [bold]0[/]",  id="stat-genres",  classes="stat-chip")
             yield Static("Unknown: [bold]0[/]", id="stat-unknown", classes="stat-chip")
 
         # ── genre table ──
@@ -360,7 +561,7 @@ class MusiOrg(App):
         # ── log ──
         with Container(id="log-panel", classes="panel"):
             yield Label("Log", classes="panel-title")
-            yield Log(id="log", max_lines=200, markup=True)
+            yield Log(id="log", max_lines=200)
 
         yield Footer()
 
@@ -380,11 +581,11 @@ class MusiOrg(App):
         lbl.update(label)
 
     def update_stats(self) -> None:
-        total = sum(len(v) for v in self.genre_map.values())
-        genres = len(self.genre_map)
+        total   = sum(len(v) for v in self.genre_map.values())
+        genres  = len(self.genre_map)
         unknown = len(self.genre_map.get(UNKNOWN_GENRE, []))
-        self.query_one("#stat-files", Static).update(f"Files: [bold]{total}[/]")
-        self.query_one("#stat-genres", Static).update(f"Genres: [bold]{genres}[/]")
+        self.query_one("#stat-files",   Static).update(f"Files: [bold]{total}[/]")
+        self.query_one("#stat-genres",  Static).update(f"Genres: [bold]{genres}[/]")
         self.query_one("#stat-unknown", Static).update(f"Unknown: [bold]{unknown}[/]")
 
     def populate_table(self) -> None:
@@ -404,49 +605,47 @@ class MusiOrg(App):
             return None
         return p
 
+    def _busy(self) -> bool:
+        return self.scanning or self.organizing or self.finding_dupes
+
     # ── actions ───────────────────────────────────────────────────────────────
 
-    def action_scan(self) -> None:
-        self.on_button_pressed_scan()
-
-    def action_organize(self) -> None:
-        self.on_button_pressed_organize()
-
-    def action_reset(self) -> None:
-        self._do_reset()
+    def action_scan(self)     -> None: self.on_button_pressed_scan()
+    def action_organize(self) -> None: self.on_button_pressed_organize()
+    def action_dupes(self)    -> None: self.on_button_pressed_dupes()
+    def action_reset(self)    -> None: self._do_reset()
 
     def _do_reset(self) -> None:
         self.genre_map = {}
-        self.scanned = []
-        table = self.query_one("#genre-table", DataTable)
-        table.clear()
+        self.scanned   = []
+        self.query_one("#genre-table", DataTable).clear()
         self.update_stats()
         self.set_progress(0, "")
-        log = self.query_one("#log", Log)
-        log.clear()
+        self.query_one("#log", Log).clear()
         self.log_msg("Reset.", "dim")
 
     # ── button handler ────────────────────────────────────────────────────────
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        btn_id = event.button.id
-        if btn_id == "btn-scan":
-            self.on_button_pressed_scan()
-        elif btn_id == "btn-organize":
-            self.on_button_pressed_organize()
-        elif btn_id == "btn-reset":
-            self._do_reset()
+        dispatch = {
+            "btn-scan":     self.on_button_pressed_scan,
+            "btn-organize": self.on_button_pressed_organize,
+            "btn-dupes":    self.on_button_pressed_dupes,
+            "btn-reset":    self._do_reset,
+        }
+        fn = dispatch.get(event.button.id)
+        if fn:
+            fn()
 
     def on_button_pressed_scan(self) -> None:
-        if self.scanning or self.organizing:
+        if self._busy():
             return
         music_dir = self.get_music_dir()
-        if music_dir is None:
-            return
-        self._run_scan(music_dir)
+        if music_dir:
+            self._run_scan(music_dir)
 
     def on_button_pressed_organize(self) -> None:
-        if self.organizing or self.scanning:
+        if self._busy():
             return
         if not self.genre_map:
             self.log_msg("Scan a directory first.", "yellow")
@@ -460,12 +659,21 @@ class MusiOrg(App):
                     self._run_organize(music_dir)
 
         self.push_screen(
-            ConfirmScreen(
-                "Confirm",
-                f"Move {total} files into genre folders?",
-            ),
+            ConfirmScreen("Confirm", f"Move {total} files into genre folders?"),
             callback=handle_confirm,
         )
+
+    def on_button_pressed_dupes(self) -> None:
+        if self._busy():
+            return
+        if not self.scanned:
+            self.log_msg("Scan a directory first.", "yellow")
+            return
+        music_dir = self.get_music_dir()
+        if music_dir is None:
+            return
+        self.log_msg("Detecting duplicates by track name…", "cyan")
+        self._run_find_dupes(list(self.scanned), music_dir)
 
     # ── workers ───────────────────────────────────────────────────────────────
 
@@ -481,7 +689,9 @@ class MusiOrg(App):
             self.scanning = False
             return
 
-        self.call_from_thread(self.log_msg, f"Found {len(files)} audio file(s). Reading tags…", "dim")
+        self.call_from_thread(
+            self.log_msg, f"Found {len(files)} audio file(s). Reading tags…", "dim"
+        )
 
         genre_map: dict[str, list[Path]] = defaultdict(list)
         total = len(files)
@@ -493,7 +703,7 @@ class MusiOrg(App):
                 self.call_from_thread(self.set_progress, pct, f"{i}/{total}")
 
         self.genre_map = dict(genre_map)
-        self.scanned = files
+        self.scanned   = files
 
         self.call_from_thread(self.populate_table)
         self.call_from_thread(self.update_stats)
@@ -516,7 +726,7 @@ class MusiOrg(App):
         self.call_from_thread(self.set_progress, 0, "Working…")
 
         for i, (genre, filepath) in enumerate(files_list, 1):
-            dest_dir = music_dir / genre
+            dest_dir  = music_dir / genre
             dest_file = dest_dir / filepath.name
 
             if filepath.parent == dest_dir:
@@ -545,9 +755,88 @@ class MusiOrg(App):
             self.log_msg,
             f"Done — moved: [green]{moved}[/]  skipped: [dim]{skipped}[/]  errors: [red]{errors}[/]",
         )
-        # re-scan so table is fresh
         self.call_from_thread(self._run_scan, music_dir)
         self.organizing = False
+
+    @work(thread=True)
+    def _run_find_dupes(self, files: list[Path], music_dir: Path) -> None:
+        self.finding_dupes = True
+        self.call_from_thread(self.set_progress, 0, "Detecting duplicates…")
+
+        def progress_cb(current: int, total: int) -> None:
+            pct = (current / total) * 100
+            self.call_from_thread(self.set_progress, pct, f"{current}/{total}")
+
+        groups = find_duplicates_by_track_name(files, progress_cb=progress_cb)
+
+        self.call_from_thread(self.set_progress, 100, "Done")
+
+        if not groups:
+            self.call_from_thread(
+                self.log_msg, "No duplicates found. Your library looks clean! ✔", "green"
+            )
+            self.finding_dupes = False
+            return
+
+        dup_count = sum(len(g) - 1 for g in groups)
+        self.call_from_thread(
+            self.log_msg,
+            f"Found {len(groups)} duplicate group(s) ({dup_count} redundant file(s)).",
+            "yellow",
+        )
+
+        # Show the review modal from the main thread
+        self.call_from_thread(self._show_dup_screen, groups, music_dir)
+        self.finding_dupes = False
+
+    def _show_dup_screen(self, groups: list[list[Path]], music_dir: Path) -> None:
+        def handle_result(to_delete: list[Path]) -> None:
+            if not to_delete:
+                self.log_msg("Duplicate deletion cancelled.", "dim")
+                return
+            self._run_delete_dupes(to_delete, music_dir)
+
+        self.push_screen(DuplicateScreen(groups), callback=handle_result)
+
+    @work(thread=True)
+    def _run_delete_dupes(self, to_delete: list[Path], music_dir: Path) -> None:
+        """Move approved duplicates to the trash folder instead of hard-deleting."""
+        trash_dir = music_dir / TRASH_FOLDER
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        deleted = errors = 0
+
+        self.call_from_thread(
+            self.log_msg, f"Moving {len(to_delete)} duplicate(s) to trash…", "cyan"
+        )
+
+        for i, filepath in enumerate(to_delete, 1):
+            dest = trash_dir / filepath.name
+            counter = 1
+            while dest.exists():
+                dest = trash_dir / f"{filepath.stem} ({counter}){filepath.suffix}"
+                counter += 1
+            try:
+                shutil.move(str(filepath), str(dest))
+                self.call_from_thread(
+                    self.log_msg,
+                    f"  [dim]{filepath.name}[/] → [bold]{TRASH_FOLDER}/[/]",
+                )
+                deleted += 1
+            except Exception as e:
+                self.call_from_thread(self.log_msg, f"  ERROR: {e}", "red")
+                errors += 1
+
+            pct = (i / len(to_delete)) * 100
+            self.call_from_thread(self.set_progress, pct, f"{i}/{len(to_delete)}")
+
+        self.call_from_thread(
+            self.log_msg,
+            f"Trash done — moved: [green]{deleted}[/]  errors: [red]{errors}[/]  "
+            f"(files are in [bold]{TRASH_FOLDER}/[/], delete manually to free space)",
+            "green",
+        )
+        # Refresh the scan so stats are up to date
+        self.call_from_thread(self._run_scan, music_dir)
 
 
 # ── entry ─────────────────────────────────────────────────────────────────────
