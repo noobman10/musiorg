@@ -7,7 +7,7 @@ A terminal UI music organizer. Scans your music directory, reads genre tags from
 │  musiorg                                          12:34:56       │
 ├─────────────────────────────────────────────────────────────────┤
 │  Directory: /home/user/Music                                     │
-│  [ ⟳ Scan ]   [ ⏎ Organize ]   [ ✕ Reset ]                     │
+│  [ ⟳ Scan ]  [ ⏎ Organize ]  [ ⊕ Duplicates ]  [ ✕ Reset ]    │
 │  Files: 312    Genres: 14    Unknown: 8                          │
 │                                                                  │
 │  Genre          │ Files │ Sample                                 │
@@ -23,7 +23,7 @@ A terminal UI music organizer. Scans your music directory, reads genre tags from
 │  Found 312 audio files. Reading tags…                           │
 │  Scan complete — 312 files across 14 genre(s).                  │
 └─────────────────────────────────────────────────────────────────┘
-  [S] Scan   [O] Organize   [R] Reset   [Q] Quit
+  [S] Scan   [O] Organize   [D] Duplicates   [R] Reset   [Q] Quit
 ```
 
 ## Features
@@ -34,6 +34,7 @@ A terminal UI music organizer. Scans your music directory, reads genre tags from
 - Re-run safe — skips files already in the right folder
 - Confirm dialog before moving anything
 - Files with no genre tag go into `Unknown/`
+- **Duplicate detection** — finds duplicate tracks by title tag (falls back to filename stem), catches the same song across different formats with no extra dependencies
 - Fully keyboard-driven
 
 ## Requirements
@@ -71,18 +72,32 @@ python musiorg.py
 musiorg
 ```
 
-| Key | Action           |
-|-----|------------------|
-| `S` | Scan directory   |
-| `O` | Organize files   |
-| `R` | Reset / clear    |
-| `Q` | Quit             |
+| Key | Action |
+|-----|--------|
+| `S` | Scan directory |
+| `O` | Organize files |
+| `D` | Detect duplicates |
+| `R` | Reset / clear |
+| `Q` | Quit |
 | `Y` / `N` | Confirm dialog |
+| `A` | Accept all (duplicate screen) |
+| `C` | Cancel (duplicate screen) |
 
 1. Set the path to your music directory in the input field.
 2. Press **S** (or click *Scan*) — musiorg reads all audio tags and shows a breakdown.
 3. Review the genre table.
 4. Press **O** (or click *Organize*) — confirm the dialog and watch the files move.
+5. *(Optional)* Press **D** (or click *Duplicates*) — musiorg fingerprints your library and shows groups of duplicates. Review the suggestions and press **A** to accept.
+
+## Duplicate detection
+
+When you press **D**, musiorg:
+
+1. Reads the `title` tag from every scanned file's metadata (falls back to the filename stem if no tag is set)
+2. Groups files that share the same title — catching the same song across MP3, FLAC, OGG, etc.
+3. Opens a review screen showing each group — the suggested file to keep is highlighted in green (prefers lossless formats, then largest file size)
+4. If you press **A** to accept, the redundant files are moved to `.musiorg_trash/` inside your music directory — **nothing is permanently deleted**
+5. You can review and empty the trash folder manually when you're satisfied
 
 ## Result structure
 
@@ -95,8 +110,10 @@ musiorg
 │   └── illmatic.mp3
 ├── Electronic/
 │   └── selected_ambient_works.ogg
-└── Unknown/
-    └── untagged_file.mp3
+├── Unknown/
+│   └── untagged_file.mp3
+└── .musiorg_trash/        ← duplicates land here, not permanently deleted
+    └── kind_of_blue.mp3
 ```
 
 ## License
